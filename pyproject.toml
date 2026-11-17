@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codebase-explorer"
+version = "0.1.0"
+description = "Index a Python repository into SQLite and search it from a terminal or an MCP client."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+explorer = "explorer.cli:main"
+explorer-mcp = "explorer.mcp_server:main"
+
+[tool.setuptools]
+packages = ["explorer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
