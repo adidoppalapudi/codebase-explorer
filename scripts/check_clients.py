@@ -59,7 +59,8 @@ def main():
             "Use only codebase-explorer MCP tools. For EACH folder in "
             + json.dumps(roots)
             + ", call open_repository and retain its distinct repo_id. Call repo_overview, list_files, "
-            "search_code with checkout, file_outline and read_source on the main file found. "
+            "search_code with checkout, file_outline and read_source on the main file found, "
+            "and find_references for checkout. "
             "Report citations. Do not run shell commands, edit source, or execute repository code. "
             "Finish with MATRIX_PASS only if all three folders succeeded, otherwise explain the failure."
         )

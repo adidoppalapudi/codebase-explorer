@@ -54,7 +54,7 @@ def test_search_rejects_bad_arguments(db):
     with pytest.raises(ValueError):
         search_code(db, "user", limit=0)
     with pytest.raises(ValueError):
-        search_code(db, "user", kind="variable")
+        search_code(db, "user", kind="bogus")
 
 
 @pytest.mark.parametrize(

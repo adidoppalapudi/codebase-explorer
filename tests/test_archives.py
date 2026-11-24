@@ -184,9 +184,9 @@ def test_zip_cli_open_and_error(tmp_path, monkeypatch, capsys):
     archive = write_zip(
         tmp_path / "shop.zip", [("shop/app.py", "def checkout(): pass\n")]
     )
-    assert main(["open", str(archive)]) == 0
+    assert main(["--json", "open", str(archive)]) == 0
     assert json.loads(capsys.readouterr().out)["source_type"] == "zip"
-    assert main(["outline", str(archive), "app.py"]) == 0
+    assert main(["--json", "outline", str(archive), "app.py"]) == 0
     assert (
         json.loads(capsys.readouterr().out)["symbols"][0]["qualified_name"]
         == "checkout"

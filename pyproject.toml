@@ -4,24 +4,50 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codebase-explorer"
-version = "0.1.0"
-description = "Explore repositories with local text search, source citations, and MCP tools."
+version = "0.2.0"
+description = "Explore code repositories from Claude Code, Codex or the terminal: local search, references and hash-verified source citations over MCP."
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["mcp", "code search", "claude", "codex", "tree-sitter", "repository"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development",
+    "Environment :: Console",
+]
+# Parsers for JavaScript, TypeScript, Go, Java, Rust and C# install by default. tree-sitter
+# publishes a wheel per Python version, and 0.25 has none for Python 3.15 yet, so they are
+# left out there instead of failing to build; those files stay searchable as text.
 dependencies = [
     "mcp>=2,<3",
     "pathspec>=0.12,<2",
+    "tree-sitter>=0.25,<0.26; python_version < '3.15'",
+    "tree-sitter-javascript>=0.23,<0.26; python_version < '3.15'",
+    "tree-sitter-typescript>=0.23,<0.24; python_version < '3.15'",
+    "tree-sitter-go>=0.23,<0.26; python_version < '3.15'",
+    "tree-sitter-java>=0.23,<0.24; python_version < '3.15'",
+    "tree-sitter-rust>=0.23,<0.25; python_version < '3.15'",
+    "tree-sitter-c-sharp>=0.23,<0.25; python_version < '3.15'",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+# Try the parsers on Python versions without published wheels (needs a C compiler).
 structure = [
     "tree-sitter>=0.25,<0.26",
-    "tree-sitter-javascript>=0.25,<0.26",
+    "tree-sitter-javascript>=0.23,<0.26",
     "tree-sitter-typescript>=0.23,<0.24",
+    "tree-sitter-go>=0.23,<0.26",
+    "tree-sitter-java>=0.23,<0.24",
+    "tree-sitter-rust>=0.23,<0.25",
+    "tree-sitter-c-sharp>=0.23,<0.25",
 ]
 
+[project.urls]
+Repository = "https://github.com/adidoppalapudi/codebase-explorer"
+
 [project.scripts]
+codebase-explorer = "explorer.cli:entry"
 explorer = "explorer.cli:main"
 explorer-mcp = "explorer.mcp_server:main"
 

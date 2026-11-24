@@ -10,7 +10,10 @@ from pathlib import Path, PurePosixPath
 from explorer import storage
 from explorer.storage import Match
 
-KINDS = ("function", "class", "method", "interface", "type", "enum", "text")
+KINDS = (
+    "function", "class", "method", "interface", "type", "enum", "struct", "trait",
+    "module", "macro", "property", "constant", "variable", "text",
+)
 MAX_RESULTS = 50
 MAX_SOURCE_LINES = 400
 
@@ -24,6 +27,10 @@ class SourceError(ValueError):
 
 class StaleFileError(SourceError):
     """The file changed after indexing."""
+
+
+class MissingFileError(SourceError):
+    """An indexed file no longer exists."""
 
 
 @dataclass(frozen=True)
@@ -64,7 +71,7 @@ def search_code(
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
     limit = min(limit, MAX_RESULTS)
     query = query.strip()
-    storage.inventory(Path(db_path))  # Validate the index even for an empty query.
+    storage.check(Path(db_path))  # Validate the index even for an empty query.
 
     results: list[Match] = []
     if kind != "text" and _IDENTIFIER.fullmatch(query):
@@ -123,7 +130,7 @@ def verified_lines(db_path: Path, path: str) -> tuple[str, list[str]]:
     try:
         data = file.read_bytes()
     except FileNotFoundError:
-        raise SourceError(f"{rel} no longer exists. Run 'index' again.") from None
+        raise MissingFileError(f"{rel} no longer exists. Run 'index' again.") from None
     if hashlib.sha256(data).hexdigest() != indexed_hash:
         raise StaleFileError(f"{rel} changed after indexing. Run 'index' again.")
 
@@ -152,3 +159,88 @@ def _normalize(path: str) -> str:
     if rel in ("", "."):
         raise SourceError("Pass a file path.")
     return rel
+
+
+# ---------------------------------------------------------------- match evidence
+
+_SUFFIXES = ("ations", "ation", "ings", "ing", "ions", "ion", "ments", "ment", "ers", "er", "ed", "es", "s")
+
+
+def explain(db_path: Path, query: str, matches: list[Match]) -> list[dict]:
+    """Describe why each match was returned, so the reader can judge its relevance.
+
+    Each result gets `match_type` (exact_name, name, definition_text or file_text), the query
+    words it contains and lacks, a `strength` summary, and for text matches up to three
+    matching lines read from the verified file. Nothing is filtered out.
+    """
+    words = storage.query_words(query)
+    terms = {w: storage.identifier_terms(w) for w in words}
+    flat = list(dict.fromkeys(t for w in words for t in terms[w]))
+    symbol_ids = [m.ref for m in matches if m.kind != "text" and m.ref is not None]
+    chunk_ids = [m.ref for m in matches if m.kind == "text" and m.ref is not None]
+    in_symbol = {t: storage.matching_rows(db_path, "symbols_fts", t, symbol_ids) for t in flat}
+    in_name = {t: storage.matching_rows(db_path, "symbols_fts", t, symbol_ids, "name_terms") for t in flat}
+    in_chunk = {t: storage.matching_rows(db_path, "chunks_fts", t, chunk_ids) for t in flat}
+    wanted = query.strip().lower()
+    files: dict[str, list[str] | None] = {}
+    results = []
+    for m in matches:
+        text_hit = m.kind == "text"
+        found = in_chunk if text_hit else in_symbol
+        matched = [w for w in words if any(m.ref in found[t] for t in terms[w])]
+        named = [] if text_hit else [w for w in words if any(m.ref in in_name[t] for t in terms[w])]
+        exact = not text_hit and wanted in (
+            m.qualified_name.lower(), m.qualified_name.rsplit(".", 1)[-1].lower()
+        )
+        if exact:
+            match_type = "exact_name"
+        elif named:
+            match_type = "name"
+        else:
+            match_type = "file_text" if text_hit else "definition_text"
+        coverage = len(matched) / len(words) if words else 0.0
+        if exact or (words and len(named) == len(words)):
+            strength = "strong"  # the name itself carries every query word
+        elif coverage == 1 or len(named) >= len(words) / 2:
+            strength = "partial"
+        else:
+            strength = "weak"
+        snippet = []
+        if match_type in ("file_text", "definition_text") and matched:
+            snippet = _snippet(db_path, m, [t for w in matched for t in terms[w]], files)
+        results.append({
+            "match_type": match_type,
+            "strength": strength,
+            "matched_words": matched,
+            "missing_words": [w for w in words if w not in matched],
+            "snippet": snippet,
+        })
+    return results
+
+
+def _snippet(db_path: Path, match: Match, terms: list[str], files: dict) -> list[dict]:
+    if match.path not in files:
+        try:
+            files[match.path] = verified_lines(db_path, match.path)[1]
+        except SourceError:
+            files[match.path] = None
+    lines = files[match.path]
+    if not lines:
+        return []
+    stems = {_stem(t) for t in terms}
+    found = []
+    for number in range(match.start_line, min(match.end_line, len(lines)) + 1):
+        lowered = lines[number - 1].lower()
+        if any(stem in lowered for stem in stems):
+            found.append({"line": number, "text": lines[number - 1].strip()[:160]})
+            if len(found) == 3:
+                break
+    return found
+
+
+def _stem(term: str) -> str:
+    """A rough stem for highlighting lines, close to what the porter tokenizer matched."""
+    for suffix in _SUFFIXES:
+        if len(term) - len(suffix) >= 4 and term.endswith(suffix):
+            return term[: -len(suffix)]
+    return term

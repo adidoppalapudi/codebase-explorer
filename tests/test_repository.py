@@ -50,7 +50,7 @@ def test_open_overview_search_and_navigation(mixed, tmp_path):
     assert first["files"][0] != second["files"][0]
     assert repos.search(rid, "checkout", language="go")[0]["path"] == "main.go"
     assert repos.search(rid, "CREATE TABLE", path="schema.sql")[0]["kind"] == "text"
-    assert repos.outline(rid, "main.go")["coverage"] == "text"
+    assert repos.outline(rid, "README.md")["coverage"] == "text"
     for hit in repos.search(rid, "checkout", limit=50):
         assert repos.read(rid, hit["path"], hit["start_line"], hit["end_line"])[
             "citation"
@@ -107,10 +107,14 @@ def test_stale_refresh_isolation_and_invalid_ids(mixed, tmp_path):
     assert repos.search(rid, "differentonly") == []
     assert repos.search(other, "differentonly")
     (mixed / "README.md").write_text("changed", encoding="utf-8")
+    page = repos.read(rid, "README.md")
+    assert page["lines"] == ["changed"] and page["refreshed"]
+    strict = Repositories(tmp_path / "cache", auto_refresh=False)
+    (mixed / "README.md").write_text("changed again", encoding="utf-8")
     with pytest.raises(StaleFileError):
-        repos.read(rid, "README.md")
+        strict.read(rid, "README.md")
     assert repos.open(str(mixed))["repo_id"] == rid
-    assert repos.read(rid, "README.md")["lines"] == ["changed"]
+    assert repos.read(rid, "README.md")["lines"] == ["changed again"]
     assert Repositories(tmp_path / "cache").overview(other)["files"] == 1
     for bad in ("../other", "x" * 64, "0" * 64):
         with pytest.raises(ValueError):
@@ -176,9 +180,15 @@ def test_empty_files_and_failed_refresh_preserve_index(mixed, tmp_path, monkeypa
         raise RuntimeError("write failed")
 
     monkeypatch.setattr(storage, "write_index", fail)
+    monkeypatch.setattr(storage, "update_index", fail)
+    (mixed / "README.md").write_text("replacementword", encoding="utf-8")
     with pytest.raises(RuntimeError, match="write failed"):
         repos.open(str(mixed))
+    with pytest.raises(RuntimeError, match="write failed"):
+        repos.open(str(mixed), full=True)
+    # The old index is intact and still answers.
     assert repos.search(rid, "checkout")
+    assert not repos.search(rid, "replacementword")
     assert not list((tmp_path / "cache").glob(".explorer-*"))
 
 
@@ -256,7 +266,7 @@ def test_stdio_workflow(tmp_path, mixed, fixture):
         ):
             await session.initialize()
             tools = await session.list_tools()
-            assert len(tools.tools) == 6
+            assert len(tools.tools) == 7
             assert (
                 next(
                     t for t in tools.tools if t.name == "open_repository"
