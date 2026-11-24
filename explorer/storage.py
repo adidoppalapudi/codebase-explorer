@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -17,14 +18,17 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS files (
     id     INTEGER PRIMARY KEY,
     path   TEXT NOT NULL UNIQUE,
-    sha256 TEXT NOT NULL
+    sha256 TEXT NOT NULL,
+    language TEXT NOT NULL DEFAULT 'text',
+    coverage TEXT NOT NULL DEFAULT 'text',
+    line_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS symbols (
     id             INTEGER PRIMARY KEY,
     file_id        INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     name           TEXT NOT NULL,
     qualified_name TEXT NOT NULL,
-    kind           TEXT NOT NULL CHECK (kind IN ('function', 'class', 'method')),
+    kind           TEXT NOT NULL,
     signature      TEXT NOT NULL,
     start_line     INTEGER NOT NULL,
     end_line       INTEGER NOT NULL,
@@ -40,6 +44,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
     excerpt,
     tokenize = 'porter unicode61'
 );
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(path, content, tokenize='porter unicode61');
 """
 
 # bm25 column weights, in symbols_fts column order.
@@ -49,11 +60,48 @@ _EXCERPT_MAX_LINES = 40
 _EXCERPT_MAX_CHARS = 3_000
 _MAX_QUERY_TERMS = 16
 _IDENTIFIER_PART = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
-_STOPWORDS = frozenset("""
-    a an and are as at be by can do does for from handled how i in is it its me
-    of on or that the this to what when where which who why with
-""".split())
-_MATCH_COLUMNS = "s.qualified_name, s.kind, f.path, s.start_line, s.end_line, s.signature"
+_STOPWORDS = frozenset(
+    [
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "can",
+        "do",
+        "does",
+        "for",
+        "from",
+        "handled",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "its",
+        "me",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+    ]
+)
+_MATCH_COLUMNS = (
+    "s.qualified_name, s.kind, f.path, s.start_line, s.end_line, s.signature"
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +121,9 @@ class FileRecord:
     path: str
     sha256: str
     symbols: list[SymbolRecord]
+    text: str = ""
+    language: str = "text"
+    coverage: str = "text"
 
 
 @dataclass(frozen=True)
@@ -89,18 +140,36 @@ class Match:
         return f"{self.path}:{self.start_line}-{self.end_line}"
 
 
-def write_index(db_path: Path, root: Path, files: list[FileRecord]) -> None:
+def write_index(
+    db_path: Path, root: Path, files: list[FileRecord], diagnostics: list | None = None
+) -> None:
     """Replace the whole index with `files` in one transaction."""
     _check_fts5()
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = _connect(db_path)
     try:
+        # Rebuilding is the migration path for indexes made by 0.1.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(files)")}
+        if columns and "coverage" not in columns:
+            conn.close()
+            raise RuntimeError(
+                "Legacy index format. Choose a new database path or remove the old index and rebuild."
+            )
         conn.executescript(SCHEMA)
         with conn:
+            conn.execute("DELETE FROM chunks_fts")
+            conn.execute("DELETE FROM chunks")
             conn.execute("DELETE FROM symbols_fts")
             conn.execute("DELETE FROM symbols")
             conn.execute("DELETE FROM files")
             conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('root', ?)", (str(root),)
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('root', ?)",
+                (str(root),),
+            )
+            conn.execute("INSERT OR REPLACE INTO meta VALUES ('version', '2')")
+            conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES ('diagnostics', ?)",
+                (json.dumps(diagnostics or []),),
             )
             for file in files:
                 _insert_file(conn, file)
@@ -109,7 +178,12 @@ def write_index(db_path: Path, root: Path, files: list[FileRecord]) -> None:
 
 
 def search_names(
-    db_path: Path, name: str, kind: str | None, path_prefix: str | None, limit: int
+    db_path: Path,
+    name: str,
+    kind: str | None,
+    path_prefix: str | None,
+    limit: int,
+    language: str | None = None,
 ) -> list[Match]:
     """Symbols whose name or qualified name equals `name`, ignoring case."""
     with _reader(db_path) as conn:
@@ -119,15 +193,21 @@ def search_names(
                 WHERE (s.name = ?1 COLLATE NOCASE OR s.qualified_name = ?1 COLLATE NOCASE)
                   AND (?2 IS NULL OR s.kind = ?2)
                   AND (?3 IS NULL OR f.path LIKE ?3 ESCAPE '\\')
+                  AND (?5 IS NULL OR f.language = ?5)
                 ORDER BY f.path, s.start_line
                 LIMIT ?4""",
-            (name, kind, _like_prefix(path_prefix), limit),
+            (name, kind, _like_prefix(path_prefix), limit, language),
         ).fetchall()
     return [Match(*row) for row in rows]
 
 
 def search_text(
-    db_path: Path, text: str, kind: str | None, path_prefix: str | None, limit: int
+    db_path: Path,
+    text: str,
+    kind: str | None,
+    path_prefix: str | None,
+    limit: int,
+    language: str | None = None,
 ) -> list[Match]:
     """Full-text search over names, paths, signatures, docstrings, and source, best first.
 
@@ -146,9 +226,10 @@ def search_text(
                 WHERE symbols_fts MATCH ?1
                   AND (?2 IS NULL OR s.kind = ?2)
                   AND (?3 IS NULL OR f.path LIKE ?3 ESCAPE '\\')
+                  AND (?5 IS NULL OR f.language = ?5)
                 ORDER BY bm25(symbols_fts, {weights}), f.path, s.start_line
                 LIMIT ?4""",
-            (match, kind, _like_prefix(path_prefix), limit),
+            (match, kind, _like_prefix(path_prefix), limit, language),
         ).fetchall()
     return [Match(*row) for row in rows]
 
@@ -157,41 +238,83 @@ def indexed_file(db_path: Path, path: str) -> tuple[Path, str | None]:
     """The repository root, and the SHA-256 recorded for `path` or None if the index lacks it."""
     with _reader(db_path) as conn:
         root = conn.execute("SELECT value FROM meta WHERE key = 'root'").fetchone()
-        sha = conn.execute("SELECT sha256 FROM files WHERE path = ?", (path,)).fetchone()
+        sha = conn.execute(
+            "SELECT sha256 FROM files WHERE path = ?", (path,)
+        ).fetchone()
     if root is None:
-        raise RuntimeError("The index has no repository root. Run 'index <folder>' again.")
+        raise RuntimeError(
+            "The index has no repository root. Run 'index <folder>' again."
+        )
     return Path(root[0]), sha[0] if sha else None
 
 
 def _insert_file(conn: sqlite3.Connection, file: FileRecord) -> None:
     file_id = conn.execute(
-        "INSERT INTO files (path, sha256) VALUES (?, ?)", (file.path, file.sha256)
+        "INSERT INTO files (path, sha256, language, coverage, line_count) VALUES (?, ?, ?, ?, ?)",
+        (
+            file.path,
+            file.sha256,
+            file.language,
+            file.coverage,
+            len(file.text.split("\n")) - int(file.text.endswith("\n"))
+            if file.text
+            else 0,
+        ),
     ).lastrowid
+    lines = file.text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    for start in range(0, len(lines), 100):
+        end = min(start + 100, len(lines))
+        chunk_id = conn.execute(
+            "INSERT INTO chunks (file_id, start_line, end_line) VALUES (?, ?, ?)",
+            (file_id, start + 1, end),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO chunks_fts (rowid, path, content) VALUES (?, ?, ?)",
+            (chunk_id, file.path, "\n".join(lines[start:end])),
+        )
     for sym in file.symbols:
         symbol_id = conn.execute(
             """INSERT INTO symbols (file_id, name, qualified_name, kind,
                    signature, start_line, end_line, docstring)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (file_id, sym.name, sym.qualified_name, sym.kind, sym.signature,
-             sym.start_line, sym.end_line, sym.docstring),
+            (
+                file_id,
+                sym.name,
+                sym.qualified_name,
+                sym.kind,
+                sym.signature,
+                sym.start_line,
+                sym.end_line,
+                sym.docstring,
+            ),
         ).lastrowid
-        excerpt = "\n".join(sym.source.split("\n")[:_EXCERPT_MAX_LINES])[:_EXCERPT_MAX_CHARS]
+        excerpt = "\n".join(sym.source.split("\n")[:_EXCERPT_MAX_LINES])[
+            :_EXCERPT_MAX_CHARS
+        ]
         conn.execute(
             """INSERT INTO symbols_fts (rowid, name_terms, path, signature, docstring, excerpt)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (symbol_id, " ".join(_identifier_terms(sym.qualified_name)), file.path,
-             sym.signature, sym.docstring or "", excerpt),
+            (
+                symbol_id,
+                " ".join(_identifier_terms(sym.qualified_name)),
+                file.path,
+                sym.signature,
+                sym.docstring or "",
+                excerpt,
+            ),
         )
 
 
 def _fts_query(text: str) -> str:
     """Quoted terms joined by OR.
 
-    Every term matches [a-z0-9_]+, so user text never reaches FTS5 operators,
+    Every term contains Unicode word characters, so user text never reaches FTS5 operators,
     column filters, or quoting.
     """
     terms: list[str] = []
-    for word in re.findall(r"[A-Za-z0-9_]+", text):
+    for word in re.findall(r"\w+", text):
         if word.lower() not in _STOPWORDS:
             terms.extend(_identifier_terms(word))
     terms = list(dict.fromkeys(terms))[:_MAX_QUERY_TERMS]
@@ -235,10 +358,18 @@ def _reader(db_path: Path) -> Iterator[sqlite3.Connection]:
     """Open the index read-only for one block, then close it."""
     if not Path(db_path).is_file():
         raise FileNotFoundError(f"No index at {db_path}. Run 'index <folder>' first.")
-    conn = _connect(Path(db_path))
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     try:
         conn.execute("PRAGMA query_only = ON")
+        if conn.execute("SELECT value FROM meta WHERE key='version'").fetchone() != (
+            "2",
+        ):
+            raise RuntimeError(
+                "Unsupported index format. Rebuild using a new database path."
+            )
         yield conn
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Cannot read index: {exc}. Rebuild the index.") from exc
     finally:
         conn.close()
 
@@ -248,3 +379,47 @@ def _like_prefix(prefix: str | None) -> str | None:
         return None
     escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return escaped + "%"
+
+
+def search_chunks(
+    db_path: Path, query: str, path: str | None, limit: int, language: str | None = None
+) -> list[Match]:
+    with _reader(db_path) as conn:
+        match = _fts_query(query)
+        if not match:
+            return []
+        rows = conn.execute(
+            """SELECT f.path, 'text', f.path, c.start_line, c.end_line, ''
+            FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.rowid
+            JOIN files f ON f.id=c.file_id
+            WHERE chunks_fts MATCH ? AND (? IS NULL OR f.path LIKE ? ESCAPE '\\')
+            AND (? IS NULL OR f.language = ?)
+            ORDER BY bm25(chunks_fts, 3.0, 1.0), f.path, c.start_line LIMIT ?""",
+            (match, _like_prefix(path), _like_prefix(path), language, language, limit),
+        ).fetchall()
+    return [Match(*row) for row in rows]
+
+
+def inventory(db_path: Path) -> tuple[list[dict], list]:
+    with _reader(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        files = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT path, language, coverage, line_count FROM files ORDER BY path"
+            )
+        ]
+        diagnostics = json.loads(
+            conn.execute("SELECT value FROM meta WHERE key='diagnostics'").fetchone()[0]
+        )
+    return files, diagnostics
+
+
+def outline(db_path: Path, path: str) -> list[Match]:
+    with _reader(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT {_MATCH_COLUMNS} FROM symbols s
+            JOIN files f ON f.id=s.file_id WHERE f.path=? ORDER BY s.start_line, s.id""",
+            (path,),
+        ).fetchall()
+    return [Match(*row) for row in rows]

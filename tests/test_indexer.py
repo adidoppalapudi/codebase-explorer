@@ -109,13 +109,13 @@ def test_rejects_a_missing_folder(tmp_path):
         index_repo(tmp_path / "nope", tmp_path / "index.db")
 
 
-def test_skips_files_with_syntax_errors(repo, tmp_path):
+def test_syntax_errors_retain_text_search(repo, tmp_path):
     (repo / "app" / "broken.py").write_text("def broken(:\n    pass\n")
 
     report = index_repo(repo, tmp_path / "index.db")
 
-    assert ("app/broken.py", "syntax error on line 1") in report.skipped
-    assert search_code(report.db_path, "broken") == []
+    assert report.warnings[0][0] == 'app/broken.py'
+    assert search_code(report.db_path, "broken")[0].path == 'app/broken.py'
 
 
 def test_signatures_with_one_line_bodies_comments_and_non_ascii(repo, tmp_path):

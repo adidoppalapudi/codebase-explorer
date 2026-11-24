@@ -84,6 +84,8 @@ def test_read_source_returns_exact_numbered_lines(db):
 
 def test_every_search_citation_opens_to_its_definition(db):
     for match in search_code(db, "user", limit=50):
+        if match.kind == 'text':
+            continue
         excerpt = read_source(db, match.path, match.start_line, match.end_line)
         definition = next(line for line in excerpt.lines if not line.lstrip().startswith("@"))
         name = match.qualified_name.rsplit(".", 1)[-1]

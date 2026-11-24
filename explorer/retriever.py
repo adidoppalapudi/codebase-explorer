@@ -10,11 +10,11 @@ from pathlib import Path, PurePosixPath
 from explorer import storage
 from explorer.storage import Match
 
-KINDS = ("function", "class", "method")
+KINDS = ("function", "class", "method", "interface", "type", "enum", "text")
 MAX_RESULTS = 50
 MAX_SOURCE_LINES = 400
 
-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?")
+_IDENTIFIER = re.compile(r"[^\W\d]\w*(\.[^\W\d]\w*)?", re.UNICODE)
 _BOM = "\ufeff"
 
 
@@ -52,6 +52,7 @@ def search_code(
     limit: int = 5,
     kind: str | None = None,
     path: str | None = None,
+    language: str | None = None,
 ) -> list[Match]:
     """Exact name matches first, then full-text matches ranked by bm25.
 
@@ -63,18 +64,34 @@ def search_code(
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
     limit = min(limit, MAX_RESULTS)
     query = query.strip()
+    storage.inventory(Path(db_path))  # Validate the index even for an empty query.
 
     results: list[Match] = []
-    if _IDENTIFIER.fullmatch(query):
-        results = storage.search_names(Path(db_path), query, kind, path, limit)
+    if kind != "text" and _IDENTIFIER.fullmatch(query):
+        results = storage.search_names(
+            Path(db_path), query, kind, path, limit, language
+        )
     if len(results) < limit:
-        for hit in storage.search_text(Path(db_path), query, kind, path, limit):
+        for hit in storage.search_text(
+            Path(db_path), query, kind, path, limit, language
+        ):
             if hit not in results:
+                results.append(hit)
+    if kind in (None, "text"):
+        for hit in storage.search_chunks(Path(db_path), query, path, limit, language):
+            if not any(
+                m.path == hit.path
+                and m.start_line <= hit.start_line
+                and m.end_line >= hit.end_line
+                for m in results
+            ):
                 results.append(hit)
     return results[:limit]
 
 
-def read_source(db_path: Path, path: str, start_line: int, end_line: int) -> SourceExcerpt:
+def read_source(
+    db_path: Path, path: str, start_line: int, end_line: int
+) -> SourceExcerpt:
     """Return lines start_line through end_line of an indexed file.
 
     Line numbers start at 1 and include both ends. Raises SourceError for paths
@@ -86,6 +103,16 @@ def read_source(db_path: Path, path: str, start_line: int, end_line: int) -> Sou
     if end_line - start_line + 1 > MAX_SOURCE_LINES:
         raise SourceError(f"Request at most {MAX_SOURCE_LINES} lines at a time.")
 
+    rel, lines = verified_lines(db_path, path)
+    if end_line > len(lines):
+        raise SourceError(
+            f"{rel} has {len(lines)} lines, but the request asks for line {end_line}."
+        )
+    return SourceExcerpt(rel, start_line, end_line, lines[start_line - 1 : end_line])
+
+
+def verified_lines(db_path: Path, path: str) -> tuple[str, list[str]]:
+    """Read and verify an indexed file, including empty files. Newlines match the index."""
     rel = _normalize(path)
     root, indexed_hash = storage.indexed_file(Path(db_path), rel)
     file = (root / rel).resolve()
@@ -100,19 +127,24 @@ def read_source(db_path: Path, path: str, start_line: int, end_line: int) -> Sou
     if hashlib.sha256(data).hexdigest() != indexed_hash:
         raise StaleFileError(f"{rel} changed after indexing. Run 'index' again.")
 
-    lines = data.decode("utf-8").removeprefix(_BOM).split("\n")
+    lines = (
+        data.decode("utf-8")
+        .removeprefix(_BOM)
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .split("\n")
+    )
     if lines[-1] == "":
         lines.pop()
-    if end_line > len(lines):
-        raise SourceError(f"{rel} has {len(lines)} lines, but the request asks for line {end_line}.")
-    selected = [line.removesuffix("\r") for line in lines[start_line - 1 : end_line]]
-    return SourceExcerpt(rel, start_line, end_line, selected)
+    return rel, lines
 
 
 def _normalize(path: str) -> str:
     """Check a repository-relative POSIX path and return it in the form the index stores."""
     if "\\" in path or "\x00" in path:
-        raise SourceError(f"Use a repository-relative path with forward slashes, not {path!r}.")
+        raise SourceError(
+            f"Use a repository-relative path with forward slashes, not {path!r}."
+        )
     pure = PurePosixPath(path)
     if pure.is_absolute() or ".." in pure.parts:
         raise SourceError(f"{path} is outside the repository.")
